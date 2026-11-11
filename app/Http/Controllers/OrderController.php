@@ -2,80 +2,107 @@
 
 namespace App\Http\Controllers;
 
-use Illuminate\Http\Request;
-use App\Models\Order;
 use App\Models\Food;
+use App\Models\Order;
+use App\Models\OrderDetail;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 
 class OrderController extends Controller
 {
-    // 1. Menampilkan katalog menu untuk customer
+    /**
+     * Menampilkan katalog makanan untuk pelanggan (Halaman Utama).
+     */
     public function index()
     {
         $foods = Food::all();
         return view('customer.index', compact('foods'));
     }
 
-    // 2. Memproses checkout / pesanan dari customer
+    /**
+     * Memproses checkout pesanan pelanggan.
+     */
     public function store(Request $request)
     {
+        // Validasi data pemesan dan item yang dipilih
         $request->validate([
             'customer_name' => 'required|string|max:255',
-            'table_number' => 'required|integer',
-            'food_id' => 'required|array',
-            'quantity' => 'required|array',
+            'table_number'  => 'required|integer|min:1',
+            'items'         => 'required|array',
+            'items.*'       => 'nullable|integer|min:0',
         ]);
 
-        // Hitung total harga dan simpan pesanan
-        $totalPrice = 0;
-        $orderItems = [];
+        // Filter hanya makanan yang jumlah/qty dipesan > 0
+        $orderedItems = array_filter($request->items, fn($qty) => $qty > 0);
 
-        foreach ($request->food_id as $index => $foodId) {
-            $qty = $request->quantity[$index];
-            if ($qty > 0) {
-                $food = Food::findOrFail($foodId);
-                $subtotal = $food->price * $qty;
-                $totalPrice += $subtotal;
-
-                $orderItems[] = [
-                    'food_id' => $foodId,
-                    'quantity' => $qty,
-                    'subtotal' => $subtotal,
-                ];
-            }
-        }
-
-        if (empty($orderItems)) {
+        if (empty($orderedItems)) {
             return back()->with('error', 'Pilih minimal satu menu makanan!');
         }
 
-        $order = Order::create([
-            'customer_name' => $request->customer_name,
-            'table_number' => $request->table_number,
-            'total_price' => $totalPrice,
-            'status' => 'pending',
-        ]);
+        // Gunakan DB Transaction agar penyimpanan data order & detail aman
+        DB::beginTransaction();
+        try {
+            // 1. Simpan Header Order
+            $order = Order::create([
+                'customer_name' => $request->customer_name,
+                'table_number'  => $request->table_number,
+                'total_price'   => 0, // Dihitung di bawah
+                'status'        => 'pending',
+            ]);
 
-        foreach ($orderItems as $item) {
-            $order->orderDetails()->create($item);
+            $totalPrice = 0;
+
+            // 2. Simpan Detail Order & Hitung Subtotal
+            foreach ($orderedItems as $foodId => $quantity) {
+                $food = Food::findOrFail($foodId);
+                
+                // Perbaikan: Tambahkan operator perkalian (*) untuk menghitung subtotal
+                $subtotal = $food->price * $quantity;
+                $totalPrice += $subtotal;
+
+                OrderDetail::create([
+                    'order_id' => $order->id,
+                    'food_id'  => $food->id,
+                    'quantity' => $quantity,
+                    'price'    => $food->price,
+                    'subtotal' => $subtotal, // Perbaikan: Masukkan subtotal agar tersimpan ke database
+                ]);
+            }
+
+            // 3. Update Total Harga di Header Order
+            $order->update(['total_price' => $totalPrice]);
+
+            DB::commit();
+
+            return redirect()->route('customer.index')->with('success', 'Pesanan berhasil dibuat! Nomor Meja: ' . $order->table_number);
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return back()->with('error', 'Gagal memproses pesanan: ' . $e->getMessage());
         }
-
-        return redirect()->route('customer.index')->with('success', 'Pesanan berhasil dibuat!');
     }
 
-    // 3. Menampilkan rekap pesanan masuk di Admin Dashboard (Breeze)
+    /**
+     * Menampilkan rekap pesanan di Dashboard Admin.
+     */
     public function adminDashboard()
     {
+        // Mengambil seluruh pesanan beserta detail item & data makanan terkait (diurutkan dari yang terbaru)
         $orders = Order::with('orderDetails.food')->latest()->get();
         return view('dashboard', compact('orders'));
     }
 
-    // 4. Memperbarui status pesanan oleh admin
+    /**
+     * Update status pesanan oleh Admin.
+     */
     public function updateStatus(Request $request, $id)
     {
-        $order = Order::findOrFail($id);
-        $order->status = $request->status;
-        $order->save();
+        $request->validate([
+            'status' => 'required|string',
+        ]);
 
-        return redirect()->route('dashboard')->with('success', 'Status pesanan berhasil diperbarui!');
+        $order = Order::findOrFail($id);
+        $order->update(['status' => $request->status]);
+
+        return back()->with('success', 'Status pesanan #' . $order->id . ' berhasil diperbarui!');
     }
 }
